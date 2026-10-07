@@ -526,23 +526,66 @@ class DepBuilder {
     return nullptr;
   }
 
+  bool CanMakeByChain(Symbol target, std::vector<const Rule*>* chain) {
+    if (chain->size() >= 16)
+      return false;
+    std::vector<const Rule*> irules;
+    implicit_rules_->Get(target.str(), &irules);
+    for (auto iter = irules.rbegin(); iter != irules.rend(); ++iter) {
+      const Rule* rule = *iter;
+      if (rule->cmds.empty() ||
+          std::find(chain->begin(), chain->end(), rule) != chain->end())
+        continue;
+      chain->push_back(rule);
+      bool ok = RuleInputsAvailable(rule, target, chain);
+      chain->pop_back();
+      if (ok)
+        return true;
+    }
+    return false;
+  }
+
+  bool InputsAvailable(const Rule* rule,
+                       const Pattern& pat,
+                       Symbol output,
+                       std::vector<const Rule*>* chain) {
+    for (Symbol input : rule->inputs) {
+      std::string buf;
+      pat.AppendSubst(output.str(), input.str(), &buf);
+      Symbol in = Intern(buf);
+      if (Exists(in))
+        continue;
+      if (chain == nullptr || !CanMakeByChain(in, chain))
+        return false;
+    }
+    return true;
+  }
+
+  bool RuleInputsAvailable(const Rule* rule,
+                           Symbol output,
+                           std::vector<const Rule*>* chain) {
+    for (Symbol output_pattern : rule->output_patterns) {
+      Pattern pat(output_pattern.str());
+      if (pat.Match(output.str()) && InputsAvailable(rule, pat, output, chain))
+        return true;
+    }
+    return false;
+  }
+
   bool CanPickImplicitRule(const Rule* rule,
                            Symbol output,
                            DepNode* n,
-                           std::shared_ptr<Rule>* out_rule) {
+                           std::shared_ptr<Rule>* out_rule,
+                           bool chained = false) {
     Symbol matched;
     for (Symbol output_pattern : rule->output_patterns) {
       Pattern pat(output_pattern.str());
       if (pat.Match(output.str())) {
-        bool ok = true;
-        for (Symbol input : rule->inputs) {
-          std::string buf;
-          pat.AppendSubst(output.str(), input.str(), &buf);
-          if (!Exists(Intern(buf))) {
-            ok = false;
-            break;
-          }
-        }
+        std::vector<const Rule*> chain;
+        if (chained)
+          chain.push_back(rule);
+        bool ok = InputsAvailable(rule, pat, output,
+                                  chained ? &chain : nullptr);
 
         if (ok) {
           matched = output_pattern;
@@ -616,14 +659,41 @@ class DepBuilder {
       return true;
     }
 
+    if (PickSuffixRule(output, rule_merger, pattern_rule, vars, out_var))
+      return true;
+
+    // Like GNU make, fall back to chains of pattern rules whose
+    // intermediate inputs (e.g. foo.s for foo.o from foo.c) can be made.
+    for (auto iter = irules.rbegin(); iter != irules.rend(); ++iter) {
+      if ((*iter)->cmds.empty())
+        continue;
+      if (!CanPickImplicitRule(*iter, output, n, pattern_rule, true))
+        continue;
+      if (rule_merger) {
+        return true;
+      }
+      CHECK((*pattern_rule)->output_patterns.size() == 1);
+      vars = MergeImplicitRuleVars((*pattern_rule)->output_patterns[0], vars);
+      *out_var = vars;
+      return true;
+    }
+
+    return rule_merger != nullptr;
+  }
+
+  bool PickSuffixRule(Symbol output,
+                      const RuleMerger* rule_merger,
+                      std::shared_ptr<Rule>* pattern_rule,
+                      Vars* vars,
+                      Vars** out_var) {
     std::string_view output_suffix = GetExt(output.str());
     if (output_suffix.empty() || output_suffix.front() != '.')
-      return rule_merger != nullptr;
+      return false;
     output_suffix = output_suffix.substr(1);
 
     SuffixRuleMap::const_iterator found = suffix_rules_.find(output_suffix);
     if (found == suffix_rules_.end())
-      return rule_merger != nullptr;
+      return false;
 
     for (const std::shared_ptr<Rule>& irule : found->second) {
       CHECK(irule->inputs.size() == 1);
@@ -641,8 +711,7 @@ class DepBuilder {
       }
       return true;
     }
-
-    return rule_merger != nullptr;
+    return false;
   }
 
   DepNode* BuildPlan(Symbol output, Symbol needed_by UNUSED) {

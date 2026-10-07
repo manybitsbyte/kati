@@ -21,13 +21,18 @@
 #include <glob.h>
 #include <limits.h>
 #include <signal.h>
+#if !defined(__EMSCRIPTEN__)
 #include <spawn.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
 #endif
 
 #include <unordered_map>
@@ -47,7 +52,7 @@ bool Exists(std::string_view filename) {
 }
 
 double GetTimestampFromStat(const struct stat& st) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
   return st.st_mtime + st.st_mtim.tv_nsec * 0.001 * 0.001 * 0.001;
 #else
   return st.st_mtime;
@@ -62,6 +67,66 @@ double GetTimestamp(std::string_view filename) {
   }
   return GetTimestampFromStat(st);
 }
+
+#if defined(__EMSCRIPTEN__)
+
+// Recipes and $(shell) never fork in WebAssembly: the host runs them. The
+// host supplies Module.runCommand({cmd, cwd, shell, shellflag, stderr}),
+// returning (or resolving to) {status, output}; stderr is "stdout" when the
+// command's stderr belongs in output, "null" when it is discarded, "none"
+// when it goes to the host's own stderr.
+EM_JS_DEPS(kati_host, "$stringToNewUTF8,$UTF8ToString");
+
+EM_ASYNC_JS(char*, kati_host_run_command,
+            (const char* shell, const char* shellflag, const char* cmd,
+             const char* cwd, const char* redirect, int* status),
+            {
+  const run = Module["runCommand"];
+  let result;
+  try {
+    if (typeof run !== "function") {
+      throw new Error("kati: no Module.runCommand host hook");
+    }
+    result = await run({
+      cmd: UTF8ToString(cmd),
+      cwd: UTF8ToString(cwd),
+      shell: UTF8ToString(shell),
+      shellflag: UTF8ToString(shellflag),
+      stderr: UTF8ToString(redirect),
+    });
+  } catch (e) {
+    result = {status: 127, output: String(e && e.message || e) + "\n"};
+  }
+  const code = (result && result.status) | 0;
+  HEAP32[status >> 2] = code;
+  return stringToNewUTF8(String((result && result.output) || ""));
+});
+
+int RunCommand(const std::string& shell,
+               const std::string& shellflag,
+               const std::string& cmd,
+               RedirectStderr redirect_stderr,
+               std::string* s) {
+  char cwd[PATH_MAX];
+  if (!getcwd(cwd, PATH_MAX)) {
+    strcpy(cwd, "/");
+  }
+  const char* redirect = "none";
+  if (redirect_stderr == RedirectStderr::STDOUT) {
+    redirect = "stdout";
+  } else if (redirect_stderr == RedirectStderr::DEV_NULL) {
+    redirect = "null";
+  }
+  int code = 0;
+  char* out = kati_host_run_command(shell.c_str(), shellflag.c_str(),
+                                    cmd.c_str(), cwd, redirect, &code);
+  s->append(out);
+  free(out);
+  // Callers decode the result as a wait(2) status.
+  return (code & 0xff) << 8;
+}
+
+#else
 
 int RunCommand(const std::string& shell,
                const std::string& shellflag,
@@ -178,8 +243,12 @@ int RunCommand(const std::string& shell,
   return status;
 }
 
+#endif  // __EMSCRIPTEN__
+
 std::string GetExecutablePath() {
-#if defined(__linux__)
+#if defined(__EMSCRIPTEN__)
+  return "/bin/kati";
+#elif defined(__linux__)
   char mypath[PATH_MAX + 1];
   ssize_t l = readlink("/proc/self/exe", mypath, PATH_MAX);
   if (l < 0) {

@@ -236,7 +236,9 @@ static int Run(const std::vector<Symbol>& targets,
   for (char** p = environ; *p; p++) {
     SetVar(*p, VarOrigin::ENVIRONMENT, nullptr, Loc());
   }
+#if !defined(__EMSCRIPTEN__)
   SegfaultHandler segfault(&ev);
+#endif
 
   std::vector<Stmt*> bootstrap_asts;
   ReadBootstrapMakefile(targets, &bootstrap_asts);
